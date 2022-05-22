@@ -1,0 +1,322 @@
+---
+title: "HW5"
+author: "Gonglin Chen; 914696694"
+date: "12/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(RCurl)
+library(XML)
+library(ggplot2)
+library(htmlwidgets)
+library(plotly)
+library(scales)
+library(rjson)
+library(dplyr)
+library(crosstalk)
+```
+
+# Introduction
+
+This report summarizes the method used to create time series plots for all counties of California and the animated map of California for Covid-19 cases. The data used is obtained from the New York Times using the code provided. We filter the data for California counties only since the main focus of this report is California.
+
+# Method
+
+### Time Series Plot
+
+```{r include=FALSE}
+# The URL for the JSON changes each day. So today's URL, we want to find it in the current day's page.
+# We get the top-level page
+
+ny = htmlParse(getURLContent("https://www.nytimes.com/interactive/2020/us/coronavirus-us-cases.html?action=click&module=Top%20Stories&pgtype=Homepage"))
+
+# Then we find the HTML elements that have an immediate child text node that contains the string USA.json.
+js = xpathSApply(ny, "//*[contains(./text(), 'USA.json')]", xmlValue)
+
+#These are <script> elements containing JavaScript, not JSON.
+# But we can find the URL with a regular expression in these
+u = gsub('.*"(https://[^"]+USA.json)".*', "\\1", js)
+u = unique(u)
+# There is only 1 URL repeated multiple times.
+
+# So now we have these
+
+tt = getURLContent(u, verbose = TRUE, followlocation = TRUE)
+library(RJSONIO)
+us = fromJSON(tt)
+
+length(us$data)
+
+ca_id = us$data[grep("(state.*California|California.*state)", us$data)][[1]]$geoid
+pattern = sprintf("county.*%s|county.*%s", ca_id, ca_id)
+county_data = us$data[grep(pattern, us$data)]
+county_data = county_data[1:58]
+range = as.Date(us$range)
+dates = seq(range[1], range[2], by = "day")
+
+createTS = function(dates, mydata){
+  Cases = mydata$cases
+  Deaths = mydata$deaths
+  
+  New_Cases = c(Cases[1], rep(0, (length(Cases)-1)))
+  New_Deaths = c(Deaths[1], rep(0, (length(Deaths)-1)))
+  
+  for (i in c(2:length(Cases))){
+    New_Cases[i] = Cases[i] - Cases[(i-1)]
+    New_Deaths[i] = Deaths[i] - Deaths[(i-1)]
+  }
+  
+  case_ts = data.frame(County = rep(mydata$display_name, length(dates)), Cases = Cases, Deaths = Deaths, Population = mydata$population, New_Cases = New_Cases, New_Deaths=New_Deaths)
+  
+  return(case_ts)
+}
+
+all_ts = rbind(lapply(county_data, function(x) createTS(dates, x)))
+
+#combine all data into one dataframe for ploting
+ts = data.frame(
+  County = unlist(lapply(all_ts, function(x) return(x$County))),
+  Date = rep(dates, length(all_ts)),
+  Cases = unlist(lapply(all_ts, function(x) return(x$Cases))),
+  Deaths = unlist(lapply(all_ts, function(x) return(x$Deaths))),
+  Cases_Per = unlist(lapply(all_ts, function(x) return(x$Cases)))/unlist(lapply(all_ts, function(x) return(x$Population/1000))),
+  Deaths_Per = unlist(lapply(all_ts, function(x) return(x$Deaths)))/unlist(lapply(all_ts, function(x) return(x$Population/1000))),
+  New_Cases = unlist(lapply(all_ts, function(x) return(x$New_Cases))),
+  New_Deaths = unlist(lapply(all_ts, function(x) return(x$New_Deaths))),
+  Population = unlist(lapply(all_ts, function(x) return(x$Population)))
+)
+
+
+generateText = function(ts){
+  County = ts$County
+  Date = ts$Date
+  Cases = ts$Cases
+  Text = rep(NA, length(nrow(ts)))
+  for (i in c(1:nrow(ts))){
+    Text[i] = sprintf("%s <br>Date: %s <br>New Cases: %i <br>New Deaths: %i <br>Cases Per Thousand: %.2f <br>Deaths Per Thousand: %.2f <br>Population: %i <br>Cases: %i <br>Deaths: %i", 
+                      County[i], Date[i], ts$New_Cases[i], ts$New_Deaths[i], ts$Cases_Per[i], ts$Deaths_Per[i], ts$Population[i], Cases[i], ts$Deaths[i])
+  }
+  df = data.frame(County = County, Date = Date, Cases = Cases, Text = Text, Cases_Per = ts$Cases_Per, Deaths_Per = ts$Deaths_Per, Population = ts$Population)
+  return(df)
+}
+
+mydata = generateText(ts)
+
+# obtain the geo information from plotly
+url <- 'https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json'
+counties <- rjson::fromJSON(file=url)
+
+#only keep counties in California 
+ca_counties = counties$features[grep('US06', counties$features)]
+counties$features = ca_counties
+
+date = tail(dates,1)
+counties_name = unique(mydata$County)
+geoid = list()
+for (i in c(1:length(counties_name))){
+  id = counties$features[grep(counties_name[i], counties$features)][[1]]$id
+  geoid = unlist(c(geoid, rep(id, length(dates))))
+}
+
+mydata = cbind(mydata, geoid)
+
+mydata <- highlight_key(mydata, ~County)
+
+case_plot = ggplot(data = mydata, aes(x = Date, y = Cases, group = County, color = County, text = Text)) +
+  geom_line() +
+  labs(x = "Date",
+       y = "Total Cases")+
+  scale_y_continuous(labels = comma)
+
+cases = ggplotly(case_plot, tooltip = c("text"),
+                 dynamicTicks = TRUE)
+
+cases = cases %>%
+    layout(
+      title = 'California Covid-19 Time Series and Map',
+      
+      annotations = list(
+        list(x = 0, y = -0.25, text = "Source: New York Times.", 
+             showarrow = F, xref='paper', yref='paper', 
+             xanchor='left', yanchor='top', xshift=0, yshift=0,
+             font=list(size=10)),
+        
+        list(x = 0, y = 1.2, text = "Click to highlight a county; Double click to disable highlighting. <br>Hover to see details", 
+             showarrow = F, xref='paper', yref='paper', 
+             xanchor='left', yanchor='botton', xshift=0, yshift=0,
+             font=list(size=10))
+        ),
+      
+      autosize = T,
+      margin = list(
+        l= 50,
+        r= 50,
+        b= 100,
+        t= 100
+      ),
+      
+      updatemenus = list(
+        list(
+          type = "buttons",
+          direction ="right",
+          showactive = FALSE,
+          xanchor = 'left',
+          yanchor = 'top',
+          x = 0.95,
+          y = -0.3,
+          buttons = list(
+            
+            list(method = "restyle",
+                 args = list("visible", "legendonly"),
+                 label = "Hide All"),
+            
+            list(method = "restyle",
+                 args = list("visible", T),
+                 label = "Show All")))
+      )
+  )%>%
+  highlight(on = "plotly_click", off = "plotly_relayout", 
+            persistent = TRUE,  selected = attrs_selected(
+              showlegend = FALSE), color = "red")
+```
+
+In order to do filter out all counties for California, we use the regular expression pattern "(state.*California|California.*state)" to grep the list containing the information of California. Then the geoid is used to grep all lists of California counties using the pattern "county.*%s|county.*%s".
+
+The data contains the name of the county, the date, and the total cases and deaths of a given date. The cases listed in the original data are cumulative cases. However, the resulting plot is designed to contain information about new cases, new deaths, and pro-rated values relative to a county's population of a given date, thus suggesting further processing. We use a for loop to loop over the data to calculate desired quantities. The new cases and deaths are calculated by subtracting the cases of the previous date. For pro-rated values relative to the population, we decided to calculate cases per 1000 population and deaths per 1000 population. Then we generate a data frame. 
+
+The resulting plot shows hover text which contains the name of the county, the date, new cases and deaths, pro-rated values, population, total cases, and total deaths. The hover text is formatted before plotting. We create a new variable called "Text" in the data frame to store the hover text. An example of formatted hover text is
+
+```{r echo=FALSE}
+sprintf("%s <br>Date: %s <br>New Cases: %i <br>New Deaths: %i <br>Cases Per Thousand: %.2f <br>Deaths Per Thousand: %.2f <br>Population: %i <br>Cases: %i <br>Deaths: %i", 
+                     as.character(ts$County[1]), ts$Date[1], ts$New_Cases[1], ts$New_Deaths[1], ts$Cases_Per[1], ts$Deaths_Per[1], ts$Population[1], ts$Cases[1], ts$Deaths[1])
+```
+
+We use ggplot to create the time series plots for all counties by using counties as groups, and then we use ggplotly to convert ggplot object to an interactive plot. For the interactive plot, we want it to allow the viewer to hide all lines and then select the counties of their interests and also be able to highlight counties. 
+
+The ggplotly provide APIs that can turn a line off by clicking the legend. We found that when the viewer clicks on the legend, it triggers an event that changes the "visible" argument of that line to "legendonly". We used this mechanism to create buttons that can hide and show all lines. For the button used to hide all lines, it changes the "visible" argument of all lines to "legnedonly" once the viewer clicks the button. Similarly, the button to show all lines change the argument to "T" for all lines.
+
+For the highlight feature, plotly provide a highlight function that changes all lines' opacities besides the selected line. We set the highlight_key function to create a sharedata object for the highlight function. Highlighting is set to be active when the viewer clicks on the line to avoid the conflicts with the hover function and inactive with double clicks. 
+
+### Map
+
+```{r include=FALSE}
+
+#create data for mapping
+df = generateText(ts)
+
+df = cbind(df, geoid)
+
+index = seq(1, length(dates), 5)
+
+if (tail(index,1) != length(dates)){
+  index= c(index, length(dates))
+}
+
+#subset the data to reduce the size.
+map_data = filter(df, df$Date %in% dates[index])
+
+csl = list(c(0.2, 4), c("pink","red"))
+
+default = filter(df, df$Date == date)
+#obtain all data for current date
+
+fig = plot_ly(data = default,
+              type='choropleth',
+              colorscale = csl,
+              colorbar = list(title = "Cases Per 1000 Population"),
+              geojson = counties, 
+              locations = default$geoid,
+              showscale = T,
+              z = default$Cases_Per,
+              zmax = max(default$Cases_Per), 
+              zmin = 0,
+              text = default$Text,
+              hoverinfo = 'text',
+              marker = list(     # for the lines separating states
+                line = list (
+                 color = 'rgb(255,255,255)', 
+                 width = 2)
+               ))%>%
+  add_trace(
+    #add all data
+    data = map_data,
+    type='choropleth',
+    frame = map_data$Date,
+    colorscale = csl,
+    geojson = counties,
+    locations = map_data$geoid,
+    showscale = F,
+    #using cases per thousands to color the map since some counties have very high population, leading to very high number of cases.
+    z = map_data$Cases_Per,
+    #set static colorscale across all days
+    zmax = max(map_data$Cases_Per), 
+    zmin = 0,
+    
+    text = ~Text,
+    hoverinfo = 'text',
+    marker = list(     # for the lines separating states
+      line = list (
+        color = 'rgb(255,255,255)', 
+        width = 2)
+    )
+  )%>%
+  animation_opts(1, easing = "elastic", redraw = TRUE)%>%
+  animation_slider(
+    active = 0,
+    currentvalue = list(prefix = "Date: ")
+  )%>%
+  animation_button(
+    x = 1.02, xanchor = "left", y = 0, yanchor = "top"
+  )
+  
+fig = fig%>%layout(
+  title = list(text = "Map of Covid-19 Cases, California"),
+  legend = list(
+    title = list(text = "Cases Per 1000")
+  ),
+  
+  margin = list(
+    l= 50,
+    r= 50,
+    b= 100,
+    t= 100
+  ),
+  geo = list(
+    scope = "usa",
+    center = list(lon=c(-120),lat=c(37)),
+    projection = list(scale = 2, type='albers usa' )
+  )
+  )
+```
+
+For the animated map, we obtained the geojosn file from plotly to create polygons for every county and use the function from plotly to create the map. Then we obtain the ids of every county from the geojason file and add it as a variable to the data frame since the plot_ly requires the geoids for the locations of the polygons. 
+
+The animation part is tricky. We have tried two different ways for the animation. The first one is to create a list of all maps for all dates and a list of steps to control the order of displaying all maps by modifying the "visible" arguments with slider API from plotly. However, it requires a custom button and codes to start the animation. Therefore, we go by the animation function provided by plotly due to the limit of time. We set the frame of the animation to dates which are each step in the animation. Besides, the map will be extremely large, if we create the animation with every date in the data set. We subset the data set for every 10 days to reduce the size and the we always check to include the last date.
+
+
+# Results
+
+```{r include=FALSE}
+widget = bscols(
+  widths = c(12,12),
+  cases, fig)
+```
+
+```{r echo=FALSE}
+widget
+```
+
+The final result is shown above. The bscols function is used to combine the time series plot and time series plot. The final plot achieved the most desired functions. The viewer can click on every line of the time series plot to highlight and disable it by double clicks. The viewer can use the buttons to hide and show all lines. Both maps and time series plots have detailed hover information. 
+
+# Discussion
+
+There are still potential improvements for this project. One problem that I have encountered is the initial map of the animation, the animation function from plotly does not support the setting of the initial frame. One easy solution is to deep clone all data from the latest date and add it as the initial frame. However, this is not an ideal solution, since the animation will start at that date and there will always be an initial value in the slider. A better solution is to use the first method mentioned above for the animation and set the active value of the slider to the last date in the data set. Also, it will be ideal, if the viewer can select the county of their interest on the map and have all lines hide except the selected county. This could be achieved by obtaining the county name using js code and then change the "visible" argument to "F" except for the line of selected county.
+
+I have trouble making these work in limited time. Nevertheless, this is a very interesting project, and I would like to continue working on this project. What's more I would try to find a better solution for the animation with a better base map and try to do this for more states.
+
+# Acknowledgment
+Examples and documents from plotly website were referenced for this project. 
+url: https://plotly.com/r/
+
+
